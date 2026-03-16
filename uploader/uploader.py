@@ -9,6 +9,7 @@ import re
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -96,6 +97,7 @@ def get_drive_service():
 
 def get_youtube_service():
     creds = None
+
     if os.path.exists(TOKEN_PICKLE_PATH):
         with open(TOKEN_PICKLE_PATH, "rb") as f:
             creds = pickle.load(f)
@@ -104,7 +106,7 @@ def get_youtube_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # Should NOT happen on Railway; token must exist
+            # En Railway idealmente esto no debería pasar
             flow = InstalledAppFlow.from_client_secrets_file(
                 CLIENT_SECRETS_FILE,
                 YOUTUBE_SCOPES
@@ -119,7 +121,10 @@ def get_youtube_service():
 
 def print_channel_info(youtube):
     resp = youtube.channels().list(part="snippet", mine=True).execute()
-    ch = resp["items"][0]["snippet"]
+    items = resp.get("items", [])
+    if not items:
+        raise RuntimeError("No YouTube channel found for the authenticated account.")
+    ch = items[0]["snippet"]
     print(f"✅ Connected to YouTube channel: {ch['title']}")
 
 # =========================
@@ -128,11 +133,12 @@ def print_channel_info(youtube):
 
 def clean_video_title(raw_title: str) -> str:
     """
-    Removes everything after '#shorts' (inclusive keeps '#shorts').
+    Keeps the title only up to '#shorts' (inclusive).
+    Removes any garbage text after that.
     Examples:
-      'Mi video #shorts AB13KC' -> 'Mi video #shorts'
-      'Mi video #Shorts xyz123' -> 'Mi video #Shorts'
-      'Mi video normal' -> 'Mi video normal'
+      'Video increíble #shorts AB13KC' -> 'Video increíble #shorts'
+      'Historia brutal #Shorts xyz999' -> 'Historia brutal #Shorts'
+      'Curiosidad del día' -> 'Curiosidad del día'
     """
     title = raw_title.strip()
 
@@ -140,10 +146,8 @@ def clean_video_title(raw_title: str) -> str:
     if match:
         title = title[:match.end()].strip()
 
-    # Clean extra spaces
-    title = re.sub(r'\s+', ' ', title).strip()
+    title = re.sub(r"\s+", " ", title).strip()
 
-    # Fallback in case title ends up empty
     return title or "Short #shorts"
 
 # =========================
@@ -156,8 +160,25 @@ def list_subfolders(drive, parent_id):
         f"mimeType='application/vnd.google-apps.folder' and "
         f"trashed=false"
     )
-    r = drive.files().list(q=q, fields="files(id,name)", pageSize=200).execute()
-    return r.get("files", [])
+
+    folders = []
+    page_token = None
+
+    while True:
+        r = drive.files().list(
+            q=q,
+            fields="nextPageToken, files(id,name)",
+            pageSize=200,
+            pageToken=page_token
+        ).execute()
+
+        folders.extend(r.get("files", []))
+        page_token = r.get("nextPageToken")
+
+        if not page_token:
+            break
+
+    return folders
 
 
 def list_files_in_folder(drive, folder_id, page_size=10):
@@ -175,44 +196,82 @@ def is_folder_empty(drive, folder_id):
     return len(files) == 0
 
 
+def safe_delete_file_or_folder(drive, file_id, label="item"):
+    try:
+        drive.files().delete(fileId=file_id).execute()
+        print(f"   ✅ Deleted {label}")
+        return True
+    except HttpError as e:
+        print(f"   ⚠️ Could not delete {label} due to Drive permissions or API restrictions: {e}")
+        return False
+    except Exception as e:
+        print(f"   ⚠️ Unexpected error deleting {label}: {e}")
+        return False
+
+
 def delete_empty_ready_subfolders(drive):
     """
     Deletes empty date subfolders inside READY_ROOT_FOLDER_ID.
+    If any folder cannot be deleted, it logs and continues.
     """
     folders = list_subfolders(drive, READY_ROOT_FOLDER_ID)
     deleted_count = 0
+    skipped_count = 0
+
+    if not folders:
+        print("🧹 No subfolders found inside SHORTS_READY.")
+        return
 
     for folder in folders:
-        if is_folder_empty(drive, folder["id"]):
-            print(f"🗑 Deleting empty folder: {folder['name']}")
-            drive.files().delete(fileId=folder["id"]).execute()
-            deleted_count += 1
+        try:
+            if is_folder_empty(drive, folder["id"]):
+                print(f"🗑 Deleting empty folder: {folder['name']}")
+                deleted = safe_delete_file_or_folder(
+                    drive,
+                    folder["id"],
+                    f"folder '{folder['name']}'"
+                )
+                if deleted:
+                    deleted_count += 1
+                else:
+                    skipped_count += 1
+        except Exception as e:
+            print(f"⚠️ Error checking folder '{folder['name']}': {e}")
+            skipped_count += 1
 
     print(f"🧹 Empty folders deleted from READY: {deleted_count}")
+    if skipped_count:
+        print(f"⚠️ Empty folders skipped: {skipped_count}")
 
 
 def list_first_video(drive, folder_id):
     q = (
         f"'{folder_id}' in parents and "
-        f"mimeType contains 'video/' and trashed=false"
+        f"mimeType contains 'video/' and "
+        f"trashed=false"
     )
+
     r = drive.files().list(
         q=q,
         fields="files(id,name,createdTime)",
         orderBy="createdTime",
         pageSize=1,
     ).execute()
+
     files = r.get("files", [])
     return files[0] if files else None
 
 
 def get_next_date_folder_with_videos(drive):
     folders = list_subfolders(drive, READY_ROOT_FOLDER_ID)
-    folders.sort(key=lambda f: f["name"])  # YYYY-MM-DD
+    folders.sort(key=lambda f: f["name"])  # assumes YYYY-MM-DD
 
     for f in folders:
-        if list_first_video(drive, f["id"]):
-            return f["name"], f["id"]
+        try:
+            if list_first_video(drive, f["id"]):
+                return f["name"], f["id"]
+        except Exception as e:
+            print(f"⚠️ Could not inspect folder '{f['name']}': {e}")
 
     return None, None
 
@@ -221,8 +280,10 @@ def ensure_uploaded_date_folder(drive, date_name):
     q = (
         f"'{UPLOADED_ROOT_FOLDER_ID}' in parents and "
         f"name='{date_name}' and "
-        f"mimeType='application/vnd.google-apps.folder' and trashed=false"
+        f"mimeType='application/vnd.google-apps.folder' and "
+        f"trashed=false"
     )
+
     r = drive.files().list(q=q, fields="files(id,name)").execute()
     files = r.get("files", [])
 
@@ -234,6 +295,7 @@ def ensure_uploaded_date_folder(drive, date_name):
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [UPLOADED_ROOT_FOLDER_ID],
     }
+
     folder = drive.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
@@ -261,6 +323,7 @@ def move_file(drive, file_id, from_id, to_id):
         fileId=file_id,
         addParents=to_id,
         removeParents=from_id,
+        fields="id, parents"
     ).execute()
 
 # =========================
@@ -295,6 +358,7 @@ def upload_to_youtube(youtube, file_path, title):
 
     print(f"   🚀 Uploading {os.path.basename(file_path)}")
     resp = None
+
     while resp is None:
         status, resp = req.next_chunk()
         if status:
@@ -315,7 +379,10 @@ def main():
     drive = get_drive_service()
 
     print("🧹 Cleaning empty folders in SHORTS_READY...")
-    delete_empty_ready_subfolders(drive)
+    try:
+        delete_empty_ready_subfolders(drive)
+    except Exception as e:
+        print(f"⚠️ Cleanup step failed, continuing anyway: {e}")
 
     print("Authenticating YouTube...")
     youtube = get_youtube_service()
@@ -325,39 +392,51 @@ def main():
 
     while uploaded < MAX_UPLOADS_PER_RUN:
         date_name, ready_date_id = get_next_date_folder_with_videos(drive)
+
         if not ready_date_id:
             print("⚠️ No videos pending.")
             return
 
         print(f"📅 Using date folder: {date_name}")
+
         video = list_first_video(drive, ready_date_id)
+        if not video:
+            print(f"⚠️ No video found in folder {date_name}, continuing...")
+            continue
 
         uploaded_date_id = ensure_uploaded_date_folder(drive, date_name)
 
         print("⬇️ Downloading...")
         local_path = download_to_tmp(drive, video["id"], video["name"])
 
-        print("⬆️ Uploading to YouTube...")
-        original_title = os.path.splitext(video["name"])[0]
-        upload_to_youtube(youtube, local_path, original_title)
-
-        print("🗂 Moving file in Drive...")
-        move_file(drive, video["id"], ready_date_id, uploaded_date_id)
-
-        # If the ready folder becomes empty after moving the file, delete it too
         try:
-            if is_folder_empty(drive, ready_date_id):
-                print(f"🗑 Deleting now-empty date folder: {date_name}")
-                drive.files().delete(fileId=ready_date_id).execute()
-        except Exception as e:
-            print(f"⚠️ Could not delete folder {date_name}: {e}")
+            print("⬆️ Uploading to YouTube...")
+            original_title = os.path.splitext(video["name"])[0]
+            upload_to_youtube(youtube, local_path, original_title)
 
-        try:
-            os.remove(local_path)
-        except Exception:
-            pass
+            print("🗂 Moving file in Drive...")
+            move_file(drive, video["id"], ready_date_id, uploaded_date_id)
 
-        uploaded += 1
+            print("🧹 Checking if source folder is now empty...")
+            try:
+                if is_folder_empty(drive, ready_date_id):
+                    print(f"🗑 Deleting now-empty date folder: {date_name}")
+                    safe_delete_file_or_folder(
+                        drive,
+                        ready_date_id,
+                        f"folder '{date_name}'"
+                    )
+            except Exception as e:
+                print(f"⚠️ Could not process deletion for folder '{date_name}': {e}")
+
+            uploaded += 1
+
+        finally:
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except Exception as e:
+                print(f"⚠️ Could not remove temp file '{local_path}': {e}")
 
     print(f"🎉 Done. Uploaded {uploaded} video(s).")
 
